@@ -1,147 +1,102 @@
-# Azure Logic App Runbook Setup for Sentinel User Risk Investigation
+# SOC Runbook Automation Workflow
 
-## Objective
-Automate the full Microsoft Sentinel investigation workflow for suspicious user sign-ins and account compromise indicators using Azure Logic Apps, with Microsoft Graph, Entra ID, Sentinel, Teams/Outlook, and audit connectors.
+## Purpose
 
----
+This document provides a logical step-by-step workflow for automating alert triage, notification, resolution, and documentation for an Anomalous Sign-In alert. This document is not comprehensive, and specific actions within the proposed automation would need to be compared against a specific tenant configuration and data to be implemented for production. 
 
-## Recommended Azure design
+## High Level Workflow
 
-Use a single Logic App workflow with conditional branches and approval gates.
+To automate this workflow, we make use of Microsoft Sentinel and Azure capabilities to build custom playbooks or Logic Apps that allow actions to be taken automatically on resources and users subsequent to an alert triggering. Actions taken and alert data requested from the Logic App are possible via "Connectors" between Microsoft platform APIs (e.g., Exchange, Teams, Graph, etc.) and to other Microsoft Graph API namespaces, including `microsoft.graph.security`.
 
-Primary trigger:
-- Microsoft Sentinel connector: when an incident or alert is generated
+A task in the SOC runbook can then be automated by a trigger event we know will happen (e.g., "an Incident/Alert is created or updated"), and an action taken, conditional on the data generated from that event. The design plan logic app with permissions justified by the runbook task requirements, then adding actions that update the incident, get further involved user data, and notify the user/IAM/IR when required.
 
-Key connectors:
-- Microsoft Sentinel
-- Microsoft Entra ID / Microsoft Graph
-- Office 365 Outlook
-- Microsoft Teams
-- Azure Monitor / Log Analytics (optional for CA and log correlation)
-- Azure Key Vault (optional for secret storage)
+## Tenant Configuration & Setup Requirements
 
-Recommended hosting:
-- Logic App Standard (preferred) for better operational control, managed identity, and deployment repeatability
+- Microsoft Sentinel connected to Microsoft Defender Portal
+- Global Administrator or Privileged Role Administrator to grant admin consent to app (for custom Azure Logic App consent grant)
+- Microsoft Entra ID P2 License
+- Microsoft Sentinel Playbook Creation and Management Pre-reqs
 
----
+### Setup Steps
 
-## Prerequisites
+1. Register Logic App in tenant
+2. Ensure necessary API permissions are granted admin consent:
+   - `ThreatHunting.Read.All` — Run hunting queries for Now-30d
+   - `RoleManagementAlert.ReadWrite.Directory` — Action alerts
+   - `SecurityIncident.ReadWrite.All` — Update incidents
+   - `AuditLog.Read.All` — Queries for incident disposition determination
+   - `Directory.Read.All` — User data for investigation
+   - `User.Read.All` — Sign-in metadata
+   - `UserAuthenticationMethod.Read.All` — MFA and other authentication data
+   - `Policy.Read.All` — Conditional Access review
+   - `Mail.Read` — Mailbox investigation
+   - `Mail.Send` — Outlook mail outreach to user (email user outreach)
+   - `ChannelMessage.Send` — Teams message user outreach
+3. Enable required connectors
+4. Add app logic for triggers and actions
+5. Test/Validate
 
-1. Azure subscription with access to:
-   - Microsoft Sentinel workspace
-   - Log Analytics workspace
-   - Azure resource group
-   - Logic App Standard or Consumption service
+## Workflow
 
-2. Permissions:
-   - Sentinel contributor/responder access
-   - Microsoft Entra ID Global Reader or higher for sign-in review
-   - Security Reader / Security Admin for investigation context
-   - Graph permissions for sign-in and audit data access
-   - Exchange and Teams access for user notification
+```
+[0] Sentinel Incident/Alert
+    ↓ App Action(s):
+        Initialize variables from incident for input to subsequent actions
 
-3. Required app permissions or managed identity:
-   - `AuditLog.Read.All`
-   - `Directory.Read.All`
-   - `User.Read.All`
-   - `UserAuthenticationMethod.Read.All`
-   - `Policy.Read.All`
-   - `SecurityEvents.Read.All`
-   - `Mail.Read`
-   - `Mail.Send` if using Outlook automation
-   - `ChannelMessage.Send` for Teams outbound messaging
+[1] Acknowledge Incident & Extract Data (Logic App action)
+    ↓ App Action(s):
+        Change Incident status from "New" to "Active"
+        Assign ownership to App
+        Change Incident severity to "High"
+        Get Related Entities, Incident Title, Description
 
----
+[2-3] Check MFA + Conditional Access (parallel)
+    ↓ App Action(s):
+        Get/List User Authentication Methods
 
-## Extract the ARM resource ID from the Defender incident URL
+        Conditional:
+        IF Non-Legacy MFA exists
+            App Action(s): Notify user
+                Send email/Teams message
+            IF User recognizes location AND authorized activity
+                App Action(s): Notify TDE, close alert as "Benign Positive"
+                    Send email so detection can be updated with exclusion
+        IF Legacy MFA or NO MFA:
+            App Action(s): Notify user, escalate
+                Send email/Teams message
 
-Use a small expression-based parsing flow in the Logic App instead of trying to extract the value manually from the full string. The key is to split the URL at the `?id=` marker and then strip any trailing query parameters.
+        App Action(s): Get CAP values (success, failure, notApplied, notEnabled)
 
-### 1. Initialize the raw URL
+        Conditional:
+        IF Conditional Access does not match expected
+            App Action(s): Notify user, escalate
+                Send email/Teams message
 
-Add an action:
-- `Initialize variable`
-- Name: `IncidentUrl`
-- Type: `String`
-- Value:
+    [4] Query downstream (mailbox rules, file access, audit logs)
+        ↓ App Action(s): Graph requests to relevant endpoints for user activity
+            Mailbox rules request API endpoint example:
+            GET https://graph.microsoft.com/v1.0/users/{userId}/mailFolders/inbox/messageRules
 
-```text
-triggerBody()?['properties']?['incidentUrl']
+    [5] Manual review + Disposition decision
+        ↓ App Action(s): Update incident
+
+        Conditional:
+        IF False Positive
+            App Action(s): Mark incident as false positive
+                Close incident
+        IF Benign Positive
+            App Action(s): Mark incident as benign positive
+                Close incident
+        IF True Positive
+            App Action(s): Mark incident as true positive, escalate
+                Block-AADUser or Block-AADUserOrAdmin where appropriate
+                Send email to IAM/IR
+                Reset password
+
+[6] Close & Document (case notes)
+    App Action(s): Update incident, close incident
 ```
 
-If the trigger payload uses a different field name, substitute the correct source such as:
-
-```text
-triggerBody()?['url']
-```
-
-### 2. Extract the segment after the `id=` query parameter
-
-Add a `Compose` action named `GetArmIdSegment` with this expression:
-
-```text
-if(
-  contains(variables('IncidentUrl'), '?id='),
-  substring(variables('IncidentUrl'), add(indexOf(variables('IncidentUrl'), '?id='), 4)),
-  null
-)
-```
-
-This trims the URL down to everything after `?id=`.
-
-### 3. Remove trailing query params
-
-Add a `Set variable` action named `ArmResourceId` with:
-
-```text
-if(
-  contains(outputs('GetArmIdSegment'), '&'),
-  first(split(outputs('GetArmIdSegment'), '&')),
-  outputs('GetArmIdSegment')
-)
-```
-
-This removes any trailing values such as `&viewid=...` and leaves only the ARM resource ID.
-
-### 4. Decode URL-encoded characters
-
-If the ID is URL-encoded, add a final variable:
-
-```text
-uriComponentToString(variables('ArmResourceId'))
-```
-
-This converts values like `%2Fsubscriptions%2F` back to `/subscriptions/`.
-
-### Example
-
-Input URL:
-
-```text
-https://security.microsoft.com/incident/123456?viewid=alerts&id=/subscriptions/11111111-2222-3333-4444-555555666666/resourceGroups/rg-prod/providers/Microsoft.Security/locations/westus/alerts/abcdef123456
-```
-
-After the expression chain, the output becomes:
-
-```text
-/subscriptions/11111111-2222-3333-4444-555555666666/resourceGroups/rg-prod/providers/Microsoft.Security/locations/westus/alerts/abcdef123456
-```
-
-### Fallback pattern for encoded URLs
-
-If the portal sends the ID in an encoded format without a normal `?id=` query parameter, use this fallback:
-
-```text
-if(
-  contains(variables('IncidentUrl'), '%2Fsubscriptions%2F'),
-  uriComponentToString(variables('IncidentUrl')),
-  null
-)
-```
-
-This is useful when the URL has been normalized or passed through an intermediary service before the workflow.
-
----
 
 ## Permission mapping by investigation step
 
@@ -168,263 +123,3 @@ This is useful when the URL has been normalized or passed through an intermediar
 - `ChannelMessage.Send` is required only if the workflow posts Teams messages as part of user outreach or escalation.
 
 ---
-
-## Azure setup steps
-
-### 1. Create the Azure resource group
-
-In Azure Portal:
-1. Search for Resource Groups
-2. Click Create
-3. Set name, region, tags
-4. Save
-
-### 2. Create the Logic App Standard
-
-1. Search for Logic App (Standard)
-2. Click Create
-3. Select the new resource group
-4. Choose region close to the Sentinel workspace
-5. Set app name and plan
-6. Review and create
-
-### 3. Enable managed identity
-
-1. Open the Logic App
-2. Navigate to Identity
-3. Set System assigned to On
-4. Save
-5. Note the object ID for role assignment
-
-### 4. Assign Azure RBAC roles to the Logic App managed identity
-
-Grant access for investigation actions:
-- Reader on Log Analytics workspace
-- Sentinel Responder or Sentinel Contributor on the workspace
-- Security Reader on the subscription or workspace
-- Microsoft Entra role assignment to query sign-ins and conditional access data (via Graph/API permissions or app registration)
-
-### 5. Create an app registration for Graph access (if not using managed identity directly)
-
-1. Azure Portal > Microsoft Entra ID > App registrations > New registration
-2. Name it `Sentinel-IR-LogicApp`
-3. Use single tenant
-4. Create and note Application ID and Directory ID
-5. Add API permissions:
-   - Microsoft Graph: AuditLog.Read.All
-   - Microsoft Graph: Directory.Read.All
-   - Microsoft Graph: Policy.Read.All
-   - Microsoft Graph: User.Read.All
-   - Microsoft Graph: UserAuthenticationMethod.Read.All
-   - Microsoft Graph: SecurityEvents.Read.All
-6. Grant admin consent
-7. Store secret in Key Vault if needed
-
-### 6. Create the workflow in Logic Apps Designer
-
-Create a workflow named:
-- `Sentinel-UserRisk-Investigation`
-
-Set trigger:
-- When an incident is created or updated
-
-### 7. Add workflow variables
-
-Initialize variables:
-- `AlertId`
-- `IncidentId`
-- `UserPrincipalName`
-- `AccountName`
-- `SourceIP`
-- `SourceLocation`
-- `AlertTimestamp`
-- `Disposition`
-- `ContainmentRequired`
-- `InvestigationStatus`
-
-### 8. Add actions for alert acknowledgement
-
-Action:
-- Update incident in Microsoft Sentinel
-
-Example settings:
-- Status: In Progress
-- Severity: unchanged
-- Add notes:
-  - User principal name
-  - Source IP
-  - Source location
-  - Alert timestamp
-  - Analyst: Automation
-
-### 10. Query recent sign-ins for the user
-
-Use Microsoft Graph SignIn logs or Log Analytics query:
-- `SigninLogs`
-- filter `UserPrincipalName` equal to the impacted account
-- last 30 days
-
-Relevant fields:
-- TimeGenerated
-- ResultType
-- ResultDescription
-- IPAddress
-- LocationDetails
-- AppDisplayName
-- DeviceDetail
-- ConditionalAccessStatus
-- MFAResult
-- RiskLevelAggregated
-
-### 11. Assess suspicious behavior
-
-Add conditional logic for suspicious sign-ins:
-- new country or region
-- impossible travel
-- unfamiliar device or OS
-- unusual time-of-day
-- sign-in from suspicious IP/VPN/Proxy
-- risk level above baseline
-- failed MFA or repeated failures
-
-Example logic:
-- If sign-in is from same country and same device and same time pattern -> likely benign
-- If sign-in is from new country or anonymizing IP -> suspicious
-
-### 12. Check MFA status
-
-Use Microsoft Graph or Entra auth methods retrieval.
-
-Actions:
-- retrieve `AuthenticationMethods` for the user
-- check if MFA is enabled
-- check recent MFA registration changes
-
-Decision:
-- MFA enabled + normal location = continue to user outreach
-- MFA enabled + new country = continue to conditional access review
-- MFA disabled = escalate for investigation and possible containment
-
-### 13. Review conditional access policy evaluation
-
-Query sign-in details for:
-- `conditionalAccessStatus`
-- `riskLevelAggregated`
-- `resultType`
-- `status`
-
-Decision categories:
-- Allowed
-- Blocked
-- Challenged
-- Not evaluated
-
-Record whether policy outcome aligns with expected behavior.
-
-### 14. Notify the user via standard channel
-
-Connectors:
-- Microsoft Teams
-- Office 365 Outlook
-
-Use a notification message:
-- user account activity from location and IP
-- request confirmation if they recognize the activity
-- include a response deadline and escalation path
-
-If no response by SLA:
-- escalate to IAM/security lead using Teams/Outlook/incident comments
-
-### 15. Check downstream activity
-
-Use Microsoft Graph / Audit logs to inspect:
-- mailbox rule creation
-- mail forwarding changes
-- new inbox delegates
-- file access anomalies
-- SharePoint/OneDrive downloads
-- admin role changes
-- consent grants
-- new app registration or OAuth permissions
-
-Typical suspicious indicators:
-- new inbox rule removing mail
-- external forwarding configured
-- large file downloads
-- group membership changes
-- role assignments
-
-### 16. Determine disposition
-
-Decision logic:
-- `True Positive` if suspicious sign-in + user denies activity or no response + downstream malicious behavior
-- `False Positive` if activity matches normal user pattern
-- `Benign Positive` if user confirms legitimate access and no malicious actions occurred
-
-Document:
-- rationale
-- evidence sources
-- sign-in timeline
-- user confirmation status
-- downstream activity findings
-
-### 17. Containment if disposition is True Positive
-
-Actions:
-- disable user account
-- revoke active sessions
-- reset user password
-- block sign-ins or require re-registration
-- notify IAM team
-- open formal incident response process
-
-Connectors:
-- Microsoft Graph (user disable, password reset, revoke sessions)
-- Microsoft Teams or email to IAM/security operations
-
-### 18. Update the case and close
-
-Final actions:
-- add disposition summary to Sentinel incident
-- mark closed or resolved
-- attach summary notes and timeline
-- notify stakeholders and Tier 2/Tier 3 analysts
-
----
-
-## Required connectors and purpose
-
-| Connector | Purpose |
-|---|---|
-| Microsoft Sentinel | Trigger and incident update |
-| Microsoft Entra ID / Microsoft Graph | Sign-in history, MFA, CA, user info, account disable/reset |
-| Azure Monitor / Log Analytics | Correlate sign-ins and risk events |
-| Office 365 Outlook | User outreach and escalation email |
-| Microsoft Teams | Real-time user confirmation and SOC escalation |
-| Azure Key Vault | Store credentials and secrets securely |
-
----
-
-## Suggested workflow logic summary
-
-1. Trigger on Sentinel alert
-2. Acknowledge the incident immediately
-3. Pull last 30 days of sign-ins
-4. Compare activity to baseline user behavior
-5. Check suspicious indicators
-6. Evaluate MFA and CA policy
-7. Contact the user
-8. Review downstream activity
-9. Determine disposition
-10. Contain if true positive
-11. Document and close
-
----
-
-## Recommended implementation pattern
-
-This should be implemented as:
-- One main Logic App workflow with nested conditions
-- Manual analyst review gates before irreversible actions
-- A final incident closure block with note capture
-
