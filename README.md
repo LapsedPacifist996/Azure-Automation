@@ -4,7 +4,7 @@
 
 This document provides a logical step-by-step workflow for automating alert triage, notification, resolution, and documentation for an Anomalous Sign-In alert. This document is not comprehensive, and specific actions within the proposed automation would need to be compared against a specific tenant configuration and data to be implemented for production. 
 
-## High Level Workflow
+## Design Plan
 
 To automate this workflow, we make use of Microsoft Sentinel and Azure capabilities to build custom playbooks or Logic Apps that allow actions to be taken automatically on resources and users subsequent to an alert triggering. Actions taken and alert data requested from the Logic App are possible via "Connectors" between Microsoft platform APIs (e.g., Exchange, Teams, Graph, etc.) and to other Microsoft Graph API namespaces, including `microsoft.graph.security`.
 
